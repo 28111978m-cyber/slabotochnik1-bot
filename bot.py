@@ -1,6 +1,6 @@
 import os, json, time, subprocess, requests
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
+TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 USERS_FILE = "users.json"
