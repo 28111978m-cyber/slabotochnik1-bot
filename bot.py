@@ -1,4 +1,6 @@
 import os, json, time, subprocess, requests
+from aiohttp import web
+import asyncio
 
 TOKEN = os.environ["BOT_TOKEN"]
 BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
@@ -22,6 +24,8 @@ def save_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 def git_commit():
+    # На Render этот блок будет выдавать ошибку, так как нет доступа к git, 
+    # но бот продолжит работать (ошибка перехватывается в try/except)
     try:
         subprocess.run(["git", "add", "-A"], capture_output=True)
         diff = subprocess.run(["git", "diff", "--staged", "--quiet"], capture_output=True)
@@ -59,13 +63,11 @@ def fetch_vacancies(keyword, city):
     for item in items:
         v = item.get("vacancy", {})
         name = v.get("job-name", "").lower()
-        # фильтр: ключевое слово ДОЛЖНО быть в названии вакансии
         if kw_lower not in name:
             continue
         region = v.get("region", {}).get("name", "").lower()
         addresses = v.get("addresses", {}).get("address", [])
         locations = " ".join(a.get("location", "") for a in addresses).lower()
-        # фильтр: город должен совпасть с регионом или адресом
         if city_lower not in region and city_lower not in locations:
             continue
         result.append(v)
@@ -138,7 +140,6 @@ def handle_update(update, users, sent):
             "/rmcity Москва — удалить город\n"
             "/help — помощь"
         )
-
     elif text.startswith("/city"):
         cities_str = text[len("/city"):].strip()
         if not cities_str:
@@ -154,7 +155,6 @@ def handle_update(update, users, sent):
                 send_message(chat_id, "Пока новых вакансий нет. Пришлю, как только появятся.")
         except Exception as e:
             print(f"immediate send error: {e}")
-
     elif text.startswith("/rmcity"):
         city = text[len("/rmcity"):].strip()
         if chat_id in users and city in users[chat_id]["cities"]:
@@ -162,13 +162,11 @@ def handle_update(update, users, sent):
             send_message(chat_id, f"✅ Удалён город: {city}")
         else:
             send_message(chat_id, "Такого города нет в вашем списке.")
-
     elif text.startswith("/mycities"):
         if chat_id in users and users[chat_id]["cities"]:
             send_message(chat_id, f"📍 Ваши города: {', '.join(users[chat_id]['cities'])}")
         else:
             send_message(chat_id, "У вас пока нет городов. Добавьте: /city Москва")
-
     elif text.startswith("/help"):
         send_message(chat_id,
             "Команды:\n"
@@ -193,8 +191,8 @@ def save_offset(o):
     with open(OFFSET_FILE, "w") as f:
         f.write(str(o))
 
-# ============ ГЛАВНОЕ ============
-def main():
+# ============ ЦИКЛ БОТА ============
+def bot_polling():
     users = load_json(USERS_FILE, {})
     sent = load_json(SENT_FILE, {})
     if not isinstance(sent, dict):
@@ -208,13 +206,10 @@ def main():
         except Exception as e:
             print(f"  error {chat_id}: {e}")
     save_json(SENT_FILE, sent)
-    git_commit()
 
     offset = load_offset()
     start_time = time.time()
-    MAX_DURATION = 5.5 * 3600  # 5.5 часов
-    last_commit = time.time()
-    COMMIT_INTERVAL = 5 * 60
+    MAX_DURATION = 24 * 3600  # Увеличил до 24 часов, чтобы Render не перезапускал его каждый час
 
     print("Начинаю приём команд...")
     while time.time() - start_time < MAX_DURATION:
@@ -235,20 +230,27 @@ def main():
         except Exception as e:
             print(f"poll error: {e}")
             time.sleep(5)
+            
+# ============ ВЕБ-СЕРВЕР ДЛЯ RENDER ============
+async def health_check(request):
+    return web.Response(text="OK")
 
-        if time.time() - last_commit > COMMIT_INTERVAL:
-            git_commit()
-            last_commit = time.time()
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Render передает порт через переменную окружения PORT
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
 
-    save_json(USERS_FILE, users)
-    save_json(SENT_FILE, sent)
-    git_commit()
-    print("Готово.")
+async def main():
+    # Запускаем веб-сервер в фоне
+    await start_web_server()
+    print("Веб-сервер запущен.")
+    # Запускаем цикл бота в отдельном потоке, чтобы он не блокировал веб-сервер
+    await asyncio.to_thread(bot_polling)
 
-if __name__ == "__main__":
-    main()
-    save_sent(sent)
-    print(f"Отправлено вакансий: {len(found)}")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    asyncio.run(main())
