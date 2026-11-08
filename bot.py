@@ -7,10 +7,10 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiohttp import web
+import urllib.parse
 
 # --- НАСТРОЙКИ ---
-BOT_TOKEN = os.environ.get("BOT_TOKEN") # <-- Вставьте ваш токен
-
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -28,13 +28,20 @@ def save_data(data):
 
 # --- ИСТОЧНИК 1: HH.RU (через HTML) ---
 def search_hh(city, query="слаботочник"):
-    url = f"https://hh.ru/search/vacancy?text={query}+{city}&items_on_page=3"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    safe_query = urllib.parse.quote(f"{query} {city}")
+    url = f"https://hh.ru/search/vacancy?text={safe_query}&items_on_page=3"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "ru-RU,ru;q=0.9"
+    }
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code != 200:
+            return []
         soup = BeautifulSoup(response.text, 'html.parser')
         script_tag = soup.find('template', {'id': 'HH-Lux-InitialState'})
-        if not script_tag: return []
+        if not script_tag: 
+            return []
         data = json.loads(script_tag.text)
         vacancies = data.get('vacancySearchResult', {}).get('vacancies', [])
         results = []
@@ -48,63 +55,41 @@ def search_hh(city, query="слаботочник"):
             })
         return results
     except Exception as e:
-        print(f"Ошибка HH: {e}")
+        logging.error(f"Ошибка HH: {e}")
         return []
 
 # --- ИСТОЧНИК 2: РАБОТА В РОССИИ (trudvsem.ru) ---
 def search_trudvsem(city, query="слаботочник"):
-    # API не требует ключей, возвращает JSON
     url = "http://opendata.trudvsem.ru/api/v1/vacancies"
-    params = {"text": query, "region": city, "limit": 3}
+    # В Trudvsem поиск по региону работает через текстовый поиск
+    params = {"text": f"{query} {city}", "limit": 3}
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = requests.get(url, params=params, timeout=15)
         data = response.json()
         vacancies = data.get('results', {}).get('vacancies', [])
         results = []
         for v in vacancies[:3]:
             vac = v.get('vacancy', {})
+            salary_min = vac.get('salary_min', 0)
+            salary_max = vac.get('salary_max', 0)
+            salary_text = f"от {salary_min} до {salary_max} руб." if salary_min or salary_max else "З/п не указана"
             results.append({
                 "source": "trudvsem.ru",
                 "name": vac.get('job-name', 'Без названия'),
                 "employer": vac.get('company', {}).get('name', 'Неизвестно'),
-                "salary": f"{vac.get('salary_min', 0)} - {vac.get('salary_max', 0)} руб.",
+                "salary": salary_text,
                 "url": vac.get('vac_url', '')
             })
         return results
     except Exception as e:
-        print(f"Ошибка Trudvsem: {e}")
+        logging.error(f"Ошибка Trudvsem: {e}")
         return []
 
-# --- ИСТОЧНИК 3: ХАБР КАРЬЕРА (career.habr.com) ---
-def search_habr(city, query="слаботочник"):
-    # Внутренний API Хабр Карьеры
-    url = "https://career.habr.com/api/frontend/vacancies"
-    params = {"q": query, "location": city, "per_page": 3}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        data = response.json()
-        vacancies = data.get('list', [])
-        results = []
-        for v in vacancies[:3]:
-            results.append({
-                "source": "Хабр Карьера",
-                "name": v.get('title', 'Без названия'),
-                "employer": v.get('company', {}).get('title', 'Неизвестно'),
-                "salary": v.get('salary', {}).get('formatted', 'З/п не указана'),
-                "url": f"https://career.habr.com{v.get('href', '')}"
-            })
-        return results
-    except Exception as e:
-        print(f"Ошибка Habr: {e}")
-        return []
-
-# --- ОБЩАЯ ФУНКЦИЯ ПОИСКА ---
-def search_all_sources(city):
+# --- ОБЩАЯ ФУНКЦИЯ ПОИСКА (Синхронная) ---
+def search_all_sources_sync(city):
     all_vacancies = []
     all_vacancies.extend(search_hh(city))
     all_vacancies.extend(search_trudvsem(city))
-    all_vacancies.extend(search_habr(city))
     return all_vacancies
 
 # --- КОМАНДЫ БОТА ---
@@ -134,10 +119,12 @@ async def cmd_city(message: types.Message):
         if city not in data[user_id]: data[user_id].append(city)
     save_data(data)
     
-    await message.answer(f"✅ Сохранено: {', '.join(data[user_id])}\n\nИщу вакансии на hh.ru, Trudvsem и Хабр Карьере...")
+    await message.answer(f"✅ Сохранено: {', '.join(data[user_id])}\n\nИщу вакансии, подождите пару секунд...")
     
     for city in cities:
-        vacancies = search_all_sources(city)
+        # Запускаем синхронный парсинг в отдельном потоке, чтобы не блокировать бота
+        vacancies = await asyncio.to_thread(search_all_sources_sync, city)
+        
         if not vacancies:
             await message.answer(f"По городу {city} пока ничего не найдено.")
             continue
@@ -146,7 +133,7 @@ async def cmd_city(message: types.Message):
             text = (f"💼 <b>{v['name']}</b>\n"
                     f"🏢 {v['employer']}\n"
                     f"💰 {v['salary']}\n"
-                    f"🔗 {v['url']}\n"
+                    f"🔗 <a href='{v['url']}'>Открыть вакансию</a>\n"
                     f"📌 <i>Источник: {v['source']}</i>")
             await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -154,8 +141,10 @@ async def cmd_city(message: types.Message):
 async def cmd_mycities(message: types.Message):
     user_id = str(message.from_user.id)
     cities = load_data().get(user_id, [])
-    if not cities: await message.answer("У вас пока нет городов. Добавьте: /city Москва")
-    else: await message.answer(f"Ваши города: {', '.join(cities)}")
+    if not cities: 
+        await message.answer("У вас пока нет городов. Добавьте: /city Москва")
+    else: 
+        await message.answer(f"Ваши города: {', '.join(cities)}")
 
 @dp.message(Command("rmcity"))
 async def cmd_rmcity(message: types.Message):
