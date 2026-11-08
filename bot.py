@@ -9,7 +9,7 @@ from aiogram.filters import Command
 from aiohttp import web
 
 # --- НАСТРОЙКИ ---
-BOT_TOKEN = "9298754437:AAGQfOskEffH64fobg5v6kRAwi0XM0ic4bA" # <-- Вставьте ваш токен
+BOT_TOKEN = os.environ.get("BOT_TOKEN") # <-- Вставьте ваш токен
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
