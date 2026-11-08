@@ -1,4 +1,4 @@
-import os, json, time, subprocess, requests
+import os, json, time, requests
 from aiohttp import web
 import asyncio
 
@@ -22,18 +22,6 @@ def load_json(path, default):
 def save_json(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
-def git_commit():
-    # На Render этот блок будет выдавать ошибку, так как нет доступа к git, 
-    # но бот продолжит работать (ошибка перехватывается в try/except)
-    try:
-        subprocess.run(["git", "add", "-A"], capture_output=True)
-        diff = subprocess.run(["git", "diff", "--staged", "--quiet"], capture_output=True)
-        if diff.returncode != 0:
-            subprocess.run(["git", "commit", "-m", "auto state [skip ci]"], capture_output=True)
-            subprocess.run(["git", "push"], capture_output=True)
-    except Exception as e:
-        print(f"git error: {e}")
 
 def send_message(chat_id, text):
     for i in range(0, len(text), 4000):
@@ -208,11 +196,10 @@ def bot_polling():
     save_json(SENT_FILE, sent)
 
     offset = load_offset()
-    start_time = time.time()
-    MAX_DURATION = 24 * 3600  # Увеличил до 24 часов, чтобы Render не перезапускал его каждый час
 
     print("Начинаю приём команд...")
-    while time.time() - start_time < MAX_DURATION:
+    # Бесконечный цикл, чтобы бот работал всегда
+    while True:
         try:
             r = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=40)
             data = r.json()
@@ -240,16 +227,14 @@ async def start_web_server():
     app.router.add_get('/', health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Render передает порт через переменную окружения PORT
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
 async def main():
-    # Запускаем веб-сервер в фоне
     await start_web_server()
     print("Веб-сервер запущен.")
-    # Запускаем цикл бота в отдельном потоке, чтобы он не блокировал веб-сервер
+    # Запускаем цикл бота
     await asyncio.to_thread(bot_polling)
 
 if __name__ == '__main__':
