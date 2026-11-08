@@ -1,241 +1,159 @@
-import os, json, time, requests
-from aiohttp import web
 import asyncio
+import logging
+import json
+import os
+import requests
+from bs4 import BeautifulSoup
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
+from aiohttp import web
 
-TOKEN = os.environ["BOT_TOKEN"]
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
+# --- НАСТРОЙКИ ---
+# Вставьте сюда ваш токен от BotFather (в кавычках)
+BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
 
-USERS_FILE = "users.json"
-SENT_FILE = "sent_vacancies.json"
-OFFSET_FILE = "offset.txt"
+logging.basicConfig(level=logging.INFO)
 
-DEFAULT_KEYWORDS = ["слаботочник", "слаботочных систем", "СКУД", "видеонаблюдение", "ОПС", "слаботочка"]
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-# ============ ХЕЛПЕРЫ ============
-def load_json(path, default):
-    try:
-        with open(path, encoding="utf-8") as f:
+# --- РАБОТА С ФАЙЛОМ (СОХРАНЕНИЕ ГОРОДОВ) ---
+def load_data():
+    if os.path.exists("users.json"):
+        with open("users.json", "r", encoding="utf-8") as f:
             return json.load(f)
-    except:
-        return default
+    return {}
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def save_data(data):
+    with open("users.json", "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
 
-def send_message(chat_id, text):
-    for i in range(0, len(text), 4000):
-        try:
-            requests.post(f"{BASE_URL}/sendMessage", data={
-                "chat_id": chat_id,
-                "text": text[i:i+4000],
-                "disable_web_page_preview": True,
-            }, timeout=30)
-        except Exception as e:
-            print(f"send error: {e}")
-
-# ============ ЛОГИКА ВАКАНСИЙ ============
-def fetch_vacancies(keyword, city):
-    url = "http://opendata.trudvsem.ru/api/v1/vacancies"
-    params = {"text": keyword, "limit": 100}
+# --- ПАРСЕР ВАКАНСИЙ HH.RU ---
+def search_vacancies(city):
+    # Ищем по слову "слаботочник" + название города
+    url = f"https://hh.ru/search/vacancy?text=слаботочник+{city}&items_on_page=5"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
     try:
-        r = requests.get(url, params=params, timeout=30)
-        items = r.json().get("results", {}).get("vacancies", [])
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        script_tag = soup.find('template', {'id': 'HH-Lux-InitialState'})
+        
+        if not script_tag:
+            return []
+            
+        data = json.loads(script_tag.text)
+        vacancies = data.get('vacancySearchResult', {}).get('vacancies', [])
+        return vacancies[:5] # Возвращаем 5 штук
+        
     except Exception as e:
-        print(f"fetch error: {e}")
+        print(f"Ошибка парсинга: {e}")
         return []
 
-    kw_lower = keyword.lower()
-    city_lower = city.lower()
-    result = []
-    for item in items:
-        v = item.get("vacancy", {})
-        name = v.get("job-name", "").lower()
-        if kw_lower not in name:
-            continue
-        region = v.get("region", {}).get("name", "").lower()
-        addresses = v.get("addresses", {}).get("address", [])
-        locations = " ".join(a.get("location", "") for a in addresses).lower()
-        if city_lower not in region and city_lower not in locations:
-            continue
-        result.append(v)
-    return result
+# --- КОМАНДЫ БОТА ---
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 Привет! Я бот для поиска вакансий по слаботочке.\n\n"
+        "📍 Добавьте город, где ищете работу:\n"
+        "/city Москва\n\n"
+        "Или несколько через запятую:\n"
+        "/city Москва, Новосибирск\n\n"
+        "📃 Команды:\n"
+        "/mycities — мои города\n"
+        "/rmcity Москва — удалить город\n"
+        "/help — помощь"
+    )
 
-def format_vacancy(v):
-    name = v.get("job-name", "")
-    company = v.get("company", {}).get("name", "")
-    region = v.get("region", {}).get("name", "")
-    salary = v.get("salary", "не указана")
-    schedule = v.get("schedule", "")
-    link = v.get("vac_url", "")
-    text = f"🔧 {name}\n🏢 {company}\n📍 {region}\n💰 {salary}"
-    if schedule:
-        text += f"\n🕒 {schedule}"
-    text += f"\n🔗 {link}"
-    return text
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer("Просто добавь города через /city и я начну искать вакансии.")
 
-def send_vacancies_to_user(chat_id, user, sent):
-    cities = user.get("cities", [])
-    if not cities:
-        return 0
-    keywords = user.get("keywords", DEFAULT_KEYWORDS)
-    user_sent = set(sent.get(chat_id, []))
-    found = []
-    seen = set()
+@dp.message(Command("city"))
+async def cmd_city(message: types.Message):
+    user_id = str(message.from_user.id)
+    args = message.text.replace("/city", "").strip()
+    
+    if not args:
+        await message.answer("Напишите город после команды. Пример: /city Москва")
+        return
+
+    cities = [c.strip() for c in args.split(",")]
+    data = load_data()
+    
+    if user_id not in data:
+        data[user_id] = []
+        
     for city in cities:
-        for kw in keywords:
-            for v in fetch_vacancies(kw, city):
-                vid = v.get("id")
-                if vid and vid not in user_sent and vid not in seen:
-                    found.append((v, city))
-                    seen.add(vid)
-    if not found:
-        return 0
-
-    by_city = {}
-    for v, city in found:
-        by_city.setdefault(city, []).append(v)
-
-    for city, vacs in by_city.items():
-        header = f"🆕 {city}: {len(vacs)} новых вакансий\n\n"
-        body = "\n\n➖➖➖\n\n".join(format_vacancy(v) for v in vacs)
-        send_message(chat_id, header + body)
-        for v in vacs:
-            user_sent.add(v.get("id"))
-    sent[chat_id] = list(user_sent)
-    return len(found)
-
-# ============ КОМАНДЫ ============
-def handle_update(update, users, sent):
-    msg = update.get("message")
-    if not msg:
-        return
-    chat_id = str(msg["chat"]["id"])
-    text = (msg.get("text") or "").strip()
-    if not text:
-        return
-
-    if text.startswith("/start"):
-        users.setdefault(chat_id, {"cities": []})
-        send_message(chat_id,
-            "👋 Привет! Я бот для поиска вакансий по слаботочке.\n\n"
-            "📍 Добавьте города, где ищете работу:\n"
-            "/city Москва\n\n"
-            "Можно несколько через запятую:\n"
-            "/city Москва, Санкт-Петербург\n\n"
-            "📋 Команды:\n"
-            "/mycities — мои города\n"
-            "/rmcity Москва — удалить город\n"
-            "/help — помощь"
-        )
-    elif text.startswith("/city"):
-        cities_str = text[len("/city"):].strip()
-        if not cities_str:
-            send_message(chat_id, "Напишите: /city Москва\nИли несколько: /city Москва, Казань")
-            return
-        users.setdefault(chat_id, {"cities": []})
-        new_cities = [c.strip() for c in cities_str.split(",") if c.strip()]
-        users[chat_id]["cities"] = list(dict.fromkeys(users[chat_id]["cities"] + new_cities))
-        send_message(chat_id, f"✅ Сохранено. Ваши города: {', '.join(users[chat_id]['cities'])}\n\nИщу вакансии...")
-        try:
-            n = send_vacancies_to_user(chat_id, users[chat_id], sent)
-            if n == 0:
-                send_message(chat_id, "Пока новых вакансий нет. Пришлю, как только появятся.")
-        except Exception as e:
-            print(f"immediate send error: {e}")
-    elif text.startswith("/rmcity"):
-        city = text[len("/rmcity"):].strip()
-        if chat_id in users and city in users[chat_id]["cities"]:
-            users[chat_id]["cities"].remove(city)
-            send_message(chat_id, f"✅ Удалён город: {city}")
-        else:
-            send_message(chat_id, "Такого города нет в вашем списке.")
-    elif text.startswith("/mycities"):
-        if chat_id in users and users[chat_id]["cities"]:
-            send_message(chat_id, f"📍 Ваши города: {', '.join(users[chat_id]['cities'])}")
-        else:
-            send_message(chat_id, "У вас пока нет городов. Добавьте: /city Москва")
-    elif text.startswith("/help"):
-        send_message(chat_id,
-            "Команды:\n"
-            "/city Москва — добавить город\n"
-            "/city Москва, Казань — несколько\n"
-            "/rmcity Москва — удалить\n"
-            "/mycities — список городов\n"
-            "/help — помощь"
-        )
-    else:
-        send_message(chat_id, "Не понимаю. Напишите /help.")
-
-# ============ OFFSET ============
-def load_offset():
-    try:
-        with open(OFFSET_FILE) as f:
-            return int(f.read().strip())
-    except:
-        return 0
-
-def save_offset(o):
-    with open(OFFSET_FILE, "w") as f:
-        f.write(str(o))
-
-# ============ ЦИКЛ БОТА ============
-def bot_polling():
-    users = load_json(USERS_FILE, {})
-    sent = load_json(SENT_FILE, {})
-    if not isinstance(sent, dict):
-        sent = {}
-
-    print(f"Отправка вакансий {len(users)} пользователям...")
-    for chat_id, user in users.items():
-        try:
-            n = send_vacancies_to_user(chat_id, user, sent)
-            print(f"  {chat_id}: {n} вакансий")
-        except Exception as e:
-            print(f"  error {chat_id}: {e}")
-    save_json(SENT_FILE, sent)
-
-    offset = load_offset()
-
-    print("Начинаю приём команд...")
-    # Бесконечный цикл, чтобы бот работал всегда
-    while True:
-        try:
-            r = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 30}, timeout=40)
-            data = r.json()
-            if data.get("ok"):
-                for update in data.get("result", []):
-                    offset = update["update_id"] + 1
-                    save_offset(offset)
-                    try:
-                        handle_update(update, users, sent)
-                    except Exception as e:
-                        print(f"handle error: {e}")
-                if data.get("result"):
-                    save_json(USERS_FILE, users)
-                    save_json(SENT_FILE, sent)
-        except Exception as e:
-            print(f"poll error: {e}")
-            time.sleep(5)
+        if city not in data[user_id]:
+            data[user_id].append(city)
             
-# ============ ВЕБ-СЕРВЕР ДЛЯ RENDER ============
-async def health_check(request):
-    return web.Response(text="OK")
+    save_data(data)
+    await message.answer(f"✅ Сохранено. Ваши города: {', '.join(data[user_id])}\n\nИщу вакансии...")
+    
+    # Сразу запускаем поиск для добавленных городов
+    for city in cities:
+        vacancies = search_vacancies(city)
+        if not vacancies:
+            await message.answer(f"По городу {city} пока ничего не найдено.")
+            continue
+            
+        for v in vacancies:
+            name = v.get('name', 'Без названия')
+            employer = v.get('company', {}).get('visibleName', 'Неизвестная компания')
+            salary = v.get('compensation', {}).get('description', 'Зарплата не указана')
+            link = v.get('links', {}).get('desktop', '')
+            
+            text = f"💼 {name}\n🏢 {employer}\n💰 {salary}\n🔗 {link}"
+            await message.answer(text)
+
+@dp.message(Command("mycities"))
+async def cmd_mycities(message: types.Message):
+    user_id = str(message.from_user.id)
+    data = load_data()
+    cities = data.get(user_id, [])
+    
+    if not cities:
+        await message.answer("У вас пока нет городов. Добавьте: /city Москва")
+    else:
+        await message.answer(f"Ваши города: {', '.join(cities)}")
+
+@dp.message(Command("rmcity"))
+async def cmd_rmcity(message: types.Message):
+    user_id = str(message.from_user.id)
+    args = message.text.replace("/rmcity", "").strip()
+    data = load_data()
+    
+    if user_id in data and args in data[user_id]:
+        data[user_id].remove(args)
+        save_data(data)
+        await message.answer(f"Город {args} удален.")
+    else:
+        await message.answer("Такого города нет в вашем списке.")
+
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER (ЧТОБЫ НЕ ЗАСЫПАЛ) ---
+async def handle(request):
+    return web.Response(text="Bot is running!")
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', health_check)
+    app.router.add_get('/', handle)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
+    print(f"Веб-сервер запущен на порту {port}")
 
+# --- ЗАПУСК ---
 async def main():
+    # Запускаем веб-сервер в фоне
     await start_web_server()
-    print("Веб-сервер запущен.")
-    # Запускаем цикл бота
-    await asyncio.to_thread(bot_polling)
+    # Запускаем бота
+    await dp.start_polling(bot)
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     asyncio.run(main())
