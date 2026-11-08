@@ -11,7 +11,7 @@ from aiohttp import web
 
 # --- НАСТРОЙКИ ---
 # Вставьте сюда ваш токен от BotFather (в кавычках)
-BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+BOT_TOKEN = "9298754437:AAGQfOskEffH64fobg5v6kRAwi0XM0ic4bA"
 
 logging.basicConfig(level=logging.INFO)
 
